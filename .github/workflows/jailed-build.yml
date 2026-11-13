@@ -35,8 +35,17 @@ jobs:
         shell: bash
         run: |
           make -C jailed clean all FINALPACKAGE=1
-          DYLIB="jailed/.theos/obj/debug/PleaseDontStopTheMusic.dylib"
-          test -f "$DYLIB"
+          DYLIB="$(find jailed/.theos/obj -type f -name 'PleaseDontStopTheMusic.dylib' -print | while IFS= read -r candidate; do
+            if lipo -info "$candidate" 2>/dev/null | grep -q 'Architectures in the fat file'; then
+              echo "$candidate"
+              break
+            fi
+          done)"
+          if [ -z "$DYLIB" ]; then
+            echo "ERROR: merged dylib not found. Files produced by Theos:"
+            find jailed/.theos -type f -name '*.dylib' -print
+            exit 1
+          fi
           echo "Built: $DYLIB"
           file "$DYLIB"
           if otool -L "$DYLIB" | grep -Ei 'CydiaSubstrate|MobileSubstrate|substrate'; then
