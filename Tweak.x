@@ -1,148 +1,237 @@
 #import <AVFoundation/AVFoundation.h>
+#import <CoreFoundation/CoreFoundation.h>
+#import <objc/runtime.h>
 #import <notify.h>
 
-// PleaseDontStopTheMusic
-//
-// Default rule (every app except TikTok): when other audio is already playing,
-// the "intruder" app is forced to MixWithOthers so it joins the music as a
-// *secondary* source. The music app stays primary and keeps its lock-screen /
-// Control Center "Now Playing" controls. This is the proven v2.2.0 behaviour and
-// is left completely untouched.
-//
-// Special case — TikTok Live PiP: TikTok Live uses a sample-buffer Picture-in-
-// Picture renderer that only advances video frames while its audio session is
-// the *primary* (hardware-clock) source. Forcing it to mix freezes the PiP
-// video. So TikTok is kept primary, and — only while TikTok is in the
-// foreground — it sends a one-shot Darwin notification telling the background
-// music app to make ITS OWN session secondary (MixWithOthers) so TikTok's
-// primary session does not interrupt it. Net result: PiP video plays and the
-// music keeps going.
-//
-// Important: nothing here ever makes another app *seize* the primary session, so
-// it can never re-introduce the "intruder pauses your music" bug. The only app
-// that stays primary is TikTok itself.
+// Substrate-free implementation of PleaseDontStopTheMusic.
+// Hooks AVAudioSession with the Objective-C runtime so this jailed dylib
+// does not need Logos, CydiaSubstrate, or MobileSubstrate.
 
-static BOOL gIsVideoApp    = NO;   // TikTok: kept primary so its PiP clock runs
-static BOOL gSessionActive = NO;   // tracks setActive: state (are we playing?)
+static BOOL gIsVideoApp = NO;
+static BOOL gSessionActive = NO;
 
 static NSString *const kBegin = @"com.pdstm.pip.begin";
 
-static BOOL PDSTMShouldMix(AVAudioSession *s) {
-    if (gIsVideoApp) return NO;        // TikTok stays primary
-    return s.isOtherAudioPlaying;      // everyone else: exactly the v2.2.0 rule
+typedef BOOL (*PDSTMSetCategoryErrorIMP)(id, SEL, NSString *, NSError **);
+typedef BOOL (*PDSTMSetCategoryModeOptionsErrorIMP)(id, SEL, NSString *, NSString *, AVAudioSessionCategoryOptions, NSError **);
+typedef BOOL (*PDSTMSetCategoryModePolicyOptionsErrorIMP)(id, SEL, NSString *, NSString *, AVAudioSessionRouteSharingPolicy, AVAudioSessionCategoryOptions, NSError **);
+typedef BOOL (*PDSTMSetCategoryWithOptionsErrorIMP)(id, SEL, NSString *, AVAudioSessionCategoryOptions, NSError **);
+typedef BOOL (*PDSTMSetActiveErrorIMP)(id, SEL, BOOL, NSError **);
+typedef BOOL (*PDSTMSetActiveOptionsErrorIMP)(id, SEL, BOOL, AVAudioSessionSetActiveOptions, NSError **);
+
+static PDSTMSetCategoryErrorIMP gOrigSetCategoryError = NULL;
+static PDSTMSetCategoryModeOptionsErrorIMP gOrigSetCategoryModeOptionsError = NULL;
+static PDSTMSetCategoryModePolicyOptionsErrorIMP gOrigSetCategoryModePolicyOptionsError = NULL;
+static PDSTMSetCategoryWithOptionsErrorIMP gOrigSetCategoryWithOptionsError = NULL;
+static PDSTMSetActiveErrorIMP gOrigSetActiveError = NULL;
+static PDSTMSetActiveOptionsErrorIMP gOrigSetActiveOptionsError = NULL;
+
+static IMP PDSTMHookInstanceMethod(Class cls, SEL selector, IMP replacement) {
+    Method method = class_getInstanceMethod(cls, selector);
+    if (!method) return NULL;
+
+    IMP original = method_getImplementation(method);
+    const char *types = method_getTypeEncoding(method);
+
+    // If the implementation is inherited, add a class-local override instead
+    // of changing the superclass implementation for every other class.
+    if (class_addMethod(cls, selector, replacement, types)) return original;
+
+    Method ownMethod = class_getInstanceMethod(cls, selector);
+    return method_setImplementation(ownMethod, replacement);
 }
 
-static void PDSTMPost(NSString *name) { notify_post(name.UTF8String); }
+static BOOL PDSTMShouldMix(AVAudioSession *session) {
+    if (gIsVideoApp) return NO;
+    return session.isOtherAudioPlaying;
+}
 
-// Music side: TikTok is foreground and wants the primary session. If we are the
-// background app currently playing, make our session secondary (one shot) so we
-// keep playing instead of being interrupted. We never seize primary back here —
-// that is what previously broke Twitter/YouTube/Dr Driving.
+static void PDSTMPost(NSString *name) {
+    notify_post(name.UTF8String);
+}
+
+static void PDSTMApplyMix(AVAudioSession *session) {
+    if (!session) return;
+
+    NSString *category = session.category;
+    if ([category isEqualToString:AVAudioSessionCategorySoloAmbient])
+        category = AVAudioSessionCategoryAmbient;
+
+    AVAudioSessionCategoryOptions options =
+        session.categoryOptions | AVAudioSessionCategoryOptionMixWithOthers;
+
+    if (gOrigSetCategoryModeOptionsError) {
+        gOrigSetCategoryModeOptionsError(session,
+            @selector(setCategory:mode:options:error:),
+            category, session.mode ?: AVAudioSessionModeDefault, options, nil);
+    } else if (gOrigSetCategoryError) {
+        gOrigSetCategoryError(session, @selector(setCategory:error:), category, nil);
+    }
+}
+
 static void PDSTMGoSecondary(void) {
     if (gIsVideoApp) return;
-    AVAudioSession *s = [AVAudioSession sharedInstance];
-    NSString *cat = s.category;
-    BOOL playbackish = [cat isEqualToString:AVAudioSessionCategoryPlayback]
-                    || [cat isEqualToString:AVAudioSessionCategoryPlayAndRecord];
+
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    NSString *category = session.category;
+    BOOL playbackish =
+        [category isEqualToString:AVAudioSessionCategoryPlayback] ||
+        [category isEqualToString:AVAudioSessionCategoryPlayAndRecord];
+
     if (!gSessionActive || !playbackish) return;
-    if (s.categoryOptions & AVAudioSessionCategoryOptionMixWithOthers) return;
-    [s setCategory:cat mode:s.mode
-           options:(s.categoryOptions | AVAudioSessionCategoryOptionMixWithOthers) error:nil];
-    [s setActive:YES error:nil];
+    if (session.categoryOptions & AVAudioSessionCategoryOptionMixWithOthers) return;
+
+    PDSTMApplyMix(session);
+
+    if (gOrigSetActiveError)
+        gOrigSetActiveError(session, @selector(setActive:error:), YES, nil);
 }
 
-static void PDSTMDarwinCallback(CFNotificationCenterRef c, void *obs, CFStringRef name,
-                                const void *obj, CFDictionaryRef info) {
-    if ([(__bridge NSString *)name isEqualToString:kBegin]) PDSTMGoSecondary();
+static void PDSTMDarwinCallback(CFNotificationCenterRef center,
+                                void *observer,
+                                CFStringRef name,
+                                const void *object,
+                                CFDictionaryRef userInfo) {
+    if ([(NSString *)CFBridgingRelease(CFRetain(name)) isEqualToString:kBegin])
+        PDSTMGoSecondary();
 }
 
-%hook AVAudioSession
-
-- (BOOL)setCategory:(NSString *)category error:(NSError **)outError {
+static BOOL PDSTMSetCategoryError(id self, SEL cmd, NSString *category, NSError **error) {
     if (PDSTMShouldMix(self)) {
         if ([category isEqualToString:AVAudioSessionCategorySoloAmbient])
-            return %orig(AVAudioSessionCategoryAmbient, outError);
-        if ([category isEqualToString:AVAudioSessionCategoryPlayback])
-            return [self setCategory:category mode:AVAudioSessionModeDefault
-                             options:AVAudioSessionCategoryOptionMixWithOthers error:outError];
+            category = AVAudioSessionCategoryAmbient;
+
+        if ([category isEqualToString:AVAudioSessionCategoryPlayback] &&
+            gOrigSetCategoryModeOptionsError) {
+            return gOrigSetCategoryModeOptionsError(self,
+                @selector(setCategory:mode:options:error:),
+                category, AVAudioSessionModeDefault,
+                AVAudioSessionCategoryOptionMixWithOthers, error);
+        }
     }
-    return %orig;
+    return gOrigSetCategoryError ? gOrigSetCategoryError(self, cmd, category, error) : NO;
 }
 
-- (BOOL)setCategory:(NSString *)category mode:(NSString *)mode options:(AVAudioSessionCategoryOptions)options error:(NSError **)outError {
+static BOOL PDSTMSetCategoryModeOptionsError(id self, SEL cmd,
+                                              NSString *category, NSString *mode,
+                                              AVAudioSessionCategoryOptions options,
+                                              NSError **error) {
     if (PDSTMShouldMix(self)) {
-        if ([category isEqualToString:AVAudioSessionCategorySoloAmbient]) category = AVAudioSessionCategoryAmbient;
+        if ([category isEqualToString:AVAudioSessionCategorySoloAmbient])
+            category = AVAudioSessionCategoryAmbient;
         options |= AVAudioSessionCategoryOptionMixWithOthers;
     }
-    return %orig(category, mode, options, outError);
+    return gOrigSetCategoryModeOptionsError ?
+        gOrigSetCategoryModeOptionsError(self, cmd, category, mode, options, error) : NO;
 }
 
-- (BOOL)setCategory:(NSString *)category mode:(NSString *)mode routeSharingPolicy:(AVAudioSessionRouteSharingPolicy)policy options:(AVAudioSessionCategoryOptions)options error:(NSError **)outError {
+static BOOL PDSTMSetCategoryModePolicyOptionsError(id self, SEL cmd,
+                                                    NSString *category, NSString *mode,
+                                                    AVAudioSessionRouteSharingPolicy policy,
+                                                    AVAudioSessionCategoryOptions options,
+                                                    NSError **error) {
     if (PDSTMShouldMix(self)) {
-        if ([category isEqualToString:AVAudioSessionCategorySoloAmbient]) category = AVAudioSessionCategoryAmbient;
+        if ([category isEqualToString:AVAudioSessionCategorySoloAmbient])
+            category = AVAudioSessionCategoryAmbient;
         options |= AVAudioSessionCategoryOptionMixWithOthers;
     }
-    return %orig(category, mode, policy, options, outError);
+    return gOrigSetCategoryModePolicyOptionsError ?
+        gOrigSetCategoryModePolicyOptionsError(self, cmd, category, mode, policy, options, error) : NO;
 }
 
-- (BOOL)setCategory:(NSString *)category withOptions:(AVAudioSessionCategoryOptions)options error:(NSError **)outError {
+static BOOL PDSTMSetCategoryWithOptionsError(id self, SEL cmd,
+                                              NSString *category,
+                                              AVAudioSessionCategoryOptions options,
+                                              NSError **error) {
     if (PDSTMShouldMix(self)) {
-        if ([category isEqualToString:AVAudioSessionCategorySoloAmbient]) category = AVAudioSessionCategoryAmbient;
+        if ([category isEqualToString:AVAudioSessionCategorySoloAmbient])
+            category = AVAudioSessionCategoryAmbient;
         options |= AVAudioSessionCategoryOptionMixWithOthers;
     }
-    return %orig(category, options, outError);
+    return gOrigSetCategoryWithOptionsError ?
+        gOrigSetCategoryWithOptionsError(self, cmd, category, options, error) : NO;
 }
 
-- (BOOL)setActive:(BOOL)active error:(NSError **)outError {
+static BOOL PDSTMSetActiveError(id self, SEL cmd, BOOL active, NSError **error) {
     gSessionActive = active;
-    if (gIsVideoApp && active && self.isOtherAudioPlaying) PDSTMPost(kBegin);
-    if (active && PDSTMShouldMix(self)
-        && !(self.categoryOptions & AVAudioSessionCategoryOptionMixWithOthers)) {
-        NSString *cat = self.category;
-        if ([cat isEqualToString:AVAudioSessionCategorySoloAmbient]) cat = AVAudioSessionCategoryAmbient;
-        [self setCategory:cat mode:self.mode
-                  options:self.categoryOptions | AVAudioSessionCategoryOptionMixWithOthers error:nil];
-    }
-    return %orig;
-}
-
-- (BOOL)setActive:(BOOL)active withOptions:(AVAudioSessionSetActiveOptions)options error:(NSError **)outError {
-    gSessionActive = active;
-    if (gIsVideoApp && active && self.isOtherAudioPlaying) PDSTMPost(kBegin);
-    if (active && PDSTMShouldMix(self)
-        && !(self.categoryOptions & AVAudioSessionCategoryOptionMixWithOthers)) {
-        NSString *cat = self.category;
-        if ([cat isEqualToString:AVAudioSessionCategorySoloAmbient]) cat = AVAudioSessionCategoryAmbient;
-        [self setCategory:cat mode:self.mode
-                  options:self.categoryOptions | AVAudioSessionCategoryOptionMixWithOthers error:nil];
-    }
-    return %orig;
-}
-
-%end
-
-%ctor {
-    NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"?";
-    NSArray *video = @[ @"com.zhiliaoapp.musically",       // TikTok
-                        @"com.zhiliaoapp.musically.go",
-                        @"com.ss.iphone.ugc.Ame" ];        // TikTok (other region)
-    gIsVideoApp = [video containsObject:bid];
-
-    if (gIsVideoApp) {
-        // TikTok only posts (never observes). Tell the background music app to go
-        // secondary as TikTok comes to the foreground, before TikTok's Live audio
-        // seizes the primary session.
-        [[NSNotificationCenter defaultCenter] addObserverForName:@"UIApplicationDidBecomeActiveNotification"
-            object:nil queue:nil usingBlock:^(NSNotification *n) { PDSTMPost(kBegin); }];
-        [[NSNotificationCenter defaultCenter] addObserverForName:@"UIApplicationWillEnterForegroundNotification"
-            object:nil queue:nil usingBlock:^(NSNotification *n) { PDSTMPost(kBegin); }];
+    if (gIsVideoApp && active && [(AVAudioSession *)self isOtherAudioPlaying])
         PDSTMPost(kBegin);
-    } else {
-        // Music app only listens; it never seizes primary on its own.
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-            PDSTMDarwinCallback, (__bridge CFStringRef)kBegin, NULL,
-            CFNotificationSuspensionBehaviorDeliverImmediately);
-    }
 
-    NSLog(@"[PleaseDontStopTheMusic] loaded (bundle=%@ video=%d)", bid, gIsVideoApp);
+    if (active && PDSTMShouldMix(self) &&
+        !(((AVAudioSession *)self).categoryOptions & AVAudioSessionCategoryOptionMixWithOthers))
+        PDSTMApplyMix(self);
+
+    return gOrigSetActiveError ? gOrigSetActiveError(self, cmd, active, error) : NO;
+}
+
+static BOOL PDSTMSetActiveOptionsError(id self, SEL cmd, BOOL active,
+                                        AVAudioSessionSetActiveOptions options,
+                                        NSError **error) {
+    gSessionActive = active;
+    if (gIsVideoApp && active && [(AVAudioSession *)self isOtherAudioPlaying])
+        PDSTMPost(kBegin);
+
+    if (active && PDSTMShouldMix(self) &&
+        !(((AVAudioSession *)self).categoryOptions & AVAudioSessionCategoryOptionMixWithOthers))
+        PDSTMApplyMix(self);
+
+    return gOrigSetActiveOptionsError ?
+        gOrigSetActiveOptionsError(self, cmd, active, options, error) : NO;
+}
+
+static void PDSTMInstallHooks(void) {
+    Class cls = objc_getClass("AVAudioSession");
+    if (!cls) return;
+
+    gOrigSetCategoryError = (PDSTMSetCategoryErrorIMP)PDSTMHookInstanceMethod(
+        cls, @selector(setCategory:error:), (IMP)PDSTMSetCategoryError);
+    gOrigSetCategoryModeOptionsError = (PDSTMSetCategoryModeOptionsErrorIMP)PDSTMHookInstanceMethod(
+        cls, @selector(setCategory:mode:options:error:), (IMP)PDSTMSetCategoryModeOptionsError);
+    gOrigSetCategoryModePolicyOptionsError = (PDSTMSetCategoryModePolicyOptionsErrorIMP)PDSTMHookInstanceMethod(
+        cls, @selector(setCategory:mode:routeSharingPolicy:options:error:),
+        (IMP)PDSTMSetCategoryModePolicyOptionsError);
+    gOrigSetCategoryWithOptionsError = (PDSTMSetCategoryWithOptionsErrorIMP)PDSTMHookInstanceMethod(
+        cls, @selector(setCategory:withOptions:error:), (IMP)PDSTMSetCategoryWithOptionsError);
+    gOrigSetActiveError = (PDSTMSetActiveErrorIMP)PDSTMHookInstanceMethod(
+        cls, @selector(setActive:error:), (IMP)PDSTMSetActiveError);
+    gOrigSetActiveOptionsError = (PDSTMSetActiveOptionsErrorIMP)PDSTMHookInstanceMethod(
+        cls, @selector(setActive:withOptions:error:), (IMP)PDSTMSetActiveOptionsError);
+}
+
+__attribute__((constructor))
+static void PDSTMInit(void) {
+    @autoreleasepool {
+        NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"?";
+        NSArray *videoApps = @[
+            @"com.zhiliaoapp.musically",
+            @"com.zhiliaoapp.musically.go",
+            @"com.ss.iphone.ugc.Ame"
+        ];
+        gIsVideoApp = [videoApps containsObject:bundleID];
+
+        PDSTMInstallHooks();
+
+        if (gIsVideoApp) {
+            [[NSNotificationCenter defaultCenter]
+                addObserverForName:@"UIApplicationDidBecomeActiveNotification"
+                object:nil queue:nil
+                usingBlock:^(NSNotification *notification) { PDSTMPost(kBegin); }];
+            [[NSNotificationCenter defaultCenter]
+                addObserverForName:@"UIApplicationWillEnterForegroundNotification"
+                object:nil queue:nil
+                usingBlock:^(NSNotification *notification) { PDSTMPost(kBegin); }];
+            PDSTMPost(kBegin);
+        } else {
+            CFNotificationCenterAddObserver(
+                CFNotificationCenterGetDarwinNotifyCenter(),
+                NULL,
+                PDSTMDarwinCallback,
+                (__bridge CFStringRef)kBegin,
+                NULL,
+                CFNotificationSuspensionBehaviorDeliverImmediately);
+        }
+
+        NSLog(@"[PleaseDontStopTheMusic] loaded (bundle=%@ video=%d)",
+              bundleID, gIsVideoApp);
+    }
 }
