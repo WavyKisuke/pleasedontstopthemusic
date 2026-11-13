@@ -92,7 +92,7 @@ static void PDSTMDarwinCallback(CFNotificationCenterRef center,
                                 CFStringRef name,
                                 const void *object,
                                 CFDictionaryRef userInfo) {
-    if ([(NSString *)CFBridgingRelease(CFRetain(name)) isEqualToString:kBegin])
+    if (CFStringCompare(name, (__bridge CFStringRef)kBegin, 0) == kCFCompareEqualTo)
         PDSTMGoSecondary();
 }
 
