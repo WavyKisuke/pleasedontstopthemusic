@@ -1,0 +1,57 @@
+name: Build jailed dylib
+
+on:
+  push:
+    branches:
+      - jailed-substrate-free
+    paths:
+      - "Tweak.x"
+      - "jailed/Makefile"
+      - ".github/workflows/jailed-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-jailed:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Theos and iOS SDK
+        shell: bash
+        run: |
+          export THEOS="$GITHUB_WORKSPACE/theos"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          brew install ldid
+          git clone --recursive https://github.com/theos/theos.git "$THEOS" --depth 1
+          SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version)"
+          SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p "$THEOS/sdks"
+          ln -s "$SDK_PATH" "$THEOS/sdks/iPhoneOS${SDK_VERSION}.sdk"
+
+      - name: Build jailed dylib
+        shell: bash
+        run: |
+          make -C jailed clean all FINALPACKAGE=1
+          DYLIB="jailed/.theos/obj/debug/PleaseDontStopTheMusic.dylib"
+          test -f "$DYLIB"
+          echo "Built: $DYLIB"
+          file "$DYLIB"
+          if otool -L "$DYLIB" | grep -Ei 'CydiaSubstrate|MobileSubstrate|substrate'; then
+            echo "ERROR: substrate dependency detected"
+            exit 1
+          fi
+          if nm -u "$DYLIB" | grep -E 'MSHookMessageEx|MSHookFunction'; then
+            echo "ERROR: Substrate hook symbol detected"
+            exit 1
+          fi
+          mkdir -p artifacts
+          cp "$DYLIB" artifacts/PleaseDontStopTheMusic_jailed.dylib
+
+      - name: Upload jailed dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: PleaseDontStopTheMusic-jailed
+          path: artifacts/PleaseDontStopTheMusic_jailed.dylib
